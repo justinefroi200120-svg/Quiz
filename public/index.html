@@ -64,6 +64,8 @@
     let mySelected = null;
     let timerInterval = null;
 
+    let localQuestionIndex = -1;
+
     document.getElementById('questionsInput').value = JSON.stringify([
       {
         "text": "What is the capital of Japan?",
@@ -162,6 +164,14 @@
     }
 
     socket.on('update', data => {
+      // --- BUG FIX: Auto-reset when the question changes ---
+      if (data.currentQuestion !== localQuestionIndex) {
+        localQuestionIndex = data.currentQuestion;
+        myAnswered = false;
+        mySelected = null;
+        document.getElementById('result').innerHTML = '';
+      }
+
       renderLeaderboard(data.players || []);
 
       if (!data.quizStarted || !data.question) {
