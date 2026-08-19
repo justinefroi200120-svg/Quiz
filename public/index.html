@@ -141,6 +141,10 @@
       mySelected = index;
       socket.emit('answer', index);
       document.getElementById('result').innerHTML = '<p class="muted">Answer submitted. Waiting for result...</p>';
+      
+      // Instantly disable buttons on the user's screen so they don't get interrupted
+      const choiceButtons = document.querySelectorAll('.choice');
+      choiceButtons.forEach(btn => btn.disabled = true);
     }
 
     function renderLeaderboard(players) {
@@ -184,14 +188,25 @@
       document.getElementById('questionTitle').innerText = 'Question ' + (data.currentQuestion + 1) + ' of ' + data.totalQuestions + ': ' + data.question.text;
       startTimer(data.timeLeft || data.question.timeLimit || 0);
 
-      const buttons = data.question.choices.map((c, i) => {
-        let extra = '';
-        if (data.revealAnswer && data.correctAnswer === i) extra = ' ✅';
-        return '<button class="choice" onclick="answer(' + i + ')" ' + ((myAnswered || data.revealAnswer) ? 'disabled' : '') + '>' + c + extra + '</button>';
-      }).join('');
+      // PASTE THIS NEW CODE:
+      const choicesContainer = document.getElementById('choices');
+      
+      // Check if we have already revealed the answer
+      const isAlreadyRevealed = choicesContainer.innerHTML.includes('✅');
+      
+      // Only redraw if the container is empty, OR if it is time to reveal the answer
+      const needsRedraw = choicesContainer.innerHTML === '' || (data.revealAnswer && !isAlreadyRevealed);
 
-      document.getElementById('choices').innerHTML = buttons;
+      if (needsRedraw) {
+        const buttons = data.question.choices.map((c, i) => {
+          let extra = '';
+          if (data.revealAnswer && data.correctAnswer === i) extra = ' ✅';
+          return '<button class="choice" onclick="answer(' + i + ')" ' + ((myAnswered || data.revealAnswer) ? 'disabled' : '') + '>' + c + extra + '</button>';
+        }).join('');
 
+        choicesContainer.innerHTML = buttons;
+      }
+      
       if (data.revealAnswer) {
         if (mySelected === null) document.getElementById('result').innerHTML = '<p class="bad">No answer submitted.</p>';
         else if (mySelected === data.correctAnswer) document.getElementById('result').innerHTML = '<p class="good">Correct answer.</p>';

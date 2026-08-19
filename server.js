@@ -20,8 +20,9 @@ let questions = [
 ];
 
 let players = {};
+let persistentScores = {}; // Add this new line to remember scores
 let teacherSocketId = null;
-const TEACHER_PASSKEY = 'froyoo';
+const TEACHER_PASSKEY = 'froyoo0120';
 let currentQuestion = -1;
 let quizStarted = false;
 let answered = {};
@@ -160,7 +161,13 @@ io.on('connection', (socket) => {
       socket.emit('error-message', 'Invalid name.');
       return;
     }
-    players[socket.id] = { name: cleanName, score: players[socket.id] ? players[socket.id].score : 0 };
+    
+    // Restore score if they refreshed, or start at 0
+    if (persistentScores[cleanName] === undefined) {
+      persistentScores[cleanName] = 0;
+    }
+    
+    players[socket.id] = { name: cleanName, score: persistentScores[cleanName] };
     socket.emit('joined', { name: cleanName });
     broadcast();
   });
@@ -197,6 +204,7 @@ io.on('connection', (socket) => {
     questionStartedAt = null;
     revealAnswer = false;
     Object.keys(players).forEach(id => players[id].score = 0);
+    persistentScores = {};
     io.emit('new-question');
     broadcast();
   });
@@ -215,6 +223,8 @@ io.on('connection', (socket) => {
     if (isCorrect) {
       const points = calculateSpeedScore(answerTimeMs, q.timeLimit);
       players[socket.id].score += points;
+      // Add this line below to permanently back up the new score
+      persistentScores[players[socket.id].name] = players[socket.id].score; 
     }
 
     broadcast();
