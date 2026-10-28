@@ -1,243 +1,103 @@
+'use strict';
 const express = require('express');
 const http = require('http');
+const path = require('path');
+const crypto = require('crypto');
 const { Server } = require('socket.io');
 const PDFDocument = require('pdfkit');
-const path = require('path');
-
 const app = express();
-const server = http.createServer(app);
-// Increase max payload size in case the PDF gets large
-const io = new Server(server, { maxHttpBufferSize: 1e8 }); 
-
-const PORT = process.env.PORT || 3000;
-
 app.use(express.static(path.join(__dirname, 'public')));
-
-let questions = [
-  { text: 'What is the capital of the Philippines?', choices: ['Cebu', 'Davao', 'Manila', 'Baguio'], correct: 2, timeLimit: 15 },
-  { text: 'What is 5 x 6?', choices: ['11', '30', '25', '60'], correct: 1, timeLimit: 10 },
-  { text: 'Which planet is known as the Red Planet?', choices: ['Earth', 'Mars', 'Venus', 'Jupiter'], correct: 1, timeLimit: 12 }
+const server = http.createServer(app);
+const io = new Server(server);
+const PORT = process.env.PORT || 3000;
+const TEACHER_PASSKEY = process.env.TEACHER_PASSKEY;
+if (!TEACHER_PASSKEY) { console.error('Set TEACHER_PASSKEY in environment before starting Quiz App.'); process.exit(1); }
+const seedQuestions = [
+  { text:'What is the capital of the Philippines?', choices:['Cebu','Davao','Manila','Baguio'], correct:2, timeLimit:15 },
+  { text:'What is 5 x 6?', choices:['11','30','25','60'], correct:1, timeLimit:10 }
 ];
-
-let players = {};
-let persistentScores = {}; // Add this new line to remember scores
-let teacherSocketId = null;
-const TEACHER_PASSKEY = 'froyoo0120';
-let currentQuestion = -1;
-let quizStarted = false;
-let answered = {};
-let questionStartedAt = null;
-let revealAnswer = false;
-
-// Generate PDF in memory and send it to the teacher
-function saveResultsToPDF(teacherSocket) {
-  const leaderboard = Object.values(players).sort((a, b) => b.score - a.score);
-  
-  const doc = new PDFDocument({ margin: 50 });
-  
-  // Store PDF data in chunks instead of writing to a file
-  let buffers = [];
-  doc.on('data', buffers.push.bind(buffers));
-  
-  doc.on('end', () => {
-    // Combine chunks into a single Buffer
-    const pdfData = Buffer.concat(buffers);
-    if (teacherSocket) {
-      // Send the binary PDF data directly to the browser
-      teacherSocket.emit('teacher:pdf-ready', pdfData);
-    }
-  });
-
-  // Build the PDF content
-  doc.fontSize(24).font('Helvetica-Bold').text('Quiz Results', { align: 'center' });
-  doc.moveDown();
-  doc.fontSize(14).font('Helvetica').text(`Date: ${new Date().toLocaleString()}`, { align: 'center' });
-  doc.moveDown(2);
-
-  leaderboard.forEach((p, i) => {
-    doc.fontSize(16).text(`${i + 1}. ${p.name}`, { continued: true });
-    doc.text(` — ${p.score} points`, { align: 'right' });
-    doc.moveDown(0.5);
-  });
-
+const sessions = new Map();
+const teachers = new Map();
+const students = new Map();
+const ROOM_ALPHABET = '23456789ABCDEFGHJKLMNPQRSTUVWXYZ';
+function makeCode() { let code; do { code = Array.from({length:6},()=>ROOM_ALPHABET[crypto.randomInt(ROOM_ALPHABET.length)]).join(''); } while (sessions.has(code)); return code; }
+function room(code) { return `quiz:${code}`; }
+function validateQuestions(list) {
+  if (!Array.isArray(list) || list.length < 1 || list.length > 200) return null;
+  const cleaned=[];
+  for(const q of list) {
+    if(!q || typeof q.text !== 'string' || !q.text.trim() || q.text.length > 1000 || !Array.isArray(q.choices) || q.choices.length < 2 || q.choices.length > 8 || q.choices.some(c=>typeof c !== 'string' || !c.trim() || c.length > 500) || !Number.isInteger(q.correct) || q.correct < 0 || q.correct >= q.choices.length || !Number.isInteger(q.timeLimit) || q.timeLimit < 5 || q.timeLimit > 300) return null;
+    cleaned.push({text:q.text.trim(),choices:q.choices.map(c=>c.trim()),correct:q.correct,timeLimit:q.timeLimit});
+  }
+  return cleaned;
+}
+function publicPlayers(s) { return [...s.roster.values()].map(p=>({name:p.name,score:p.score,status:p.connected?'connected':'disconnected'})).sort((a,b)=>b.score-a.score||a.name.localeCompare(b.name)); }
+function timeLeft(s) { if(!s.started || s.questionIndex<0) return 0; return Math.max(0,Math.ceil((s.questionStart+s.questions[s.questionIndex].timeLimit*1000-Date.now())/1000)); }
+function publicState(s) { const q=s.questions[s.questionIndex]; return {roomCode:s.code,players:publicPlayers(s),connectedCount:[...s.roster.values()].filter(p=>p.connected).length,disconnectedCount:[...s.roster.values()].filter(p=>!p.connected).length,question:s.started&&q?{text:q.text,choices:q.choices,timeLimit:q.timeLimit}:null,questionIndex:s.questionIndex,totalQuestions:s.questions.length,started:s.started,revealed:s.revealed,correctAnswer:s.revealed&&q?q.correct:null,timeLeft:timeLeft(s),round:s.round}; }
+function broadcast(s) { io.to(room(s.code)).emit('update',publicState(s)); }
+function requireTeacher(socket) { const code=teachers.get(socket.id); return code?sessions.get(code):null; }
+function startQuestion(s,index) {
+  if(s.timer) clearTimeout(s.timer);
+  s.questionIndex=index; s.started=true; s.revealed=false; s.round++; s.answers.clear(); s.questionStart=Date.now();
+  broadcast(s);
+  const round=s.round;
+  s.timer=setTimeout(()=>{if(s.round===round&&s.started&&!s.revealed){s.revealed=true;broadcast(s);}},s.questions[index].timeLimit*1000);
+}
+function generatePdf(socket,s) {
+  const doc=new PDFDocument({margin:48}); const chunks=[];
+  doc.on('data',chunk=>chunks.push(chunk));doc.on('end',()=>socket.emit('teacher:pdf-ready',Buffer.concat(chunks)));
+  doc.fontSize(22).text(`Quiz App Results — ${s.code}`,{align:'center'}).moveDown();
+  doc.fontSize(11).text(`Exported: ${new Date().toISOString()}`).moveDown();
+  publicPlayers(s).forEach((p,i)=>doc.fontSize(12).text(`${i+1}. ${p.name} — ${p.score} points (${p.status})`).moveDown(0.4));
   doc.end();
 }
-
-function getLeaderboard() {
-  return Object.values(players).sort((a, b) => b.score - a.score || a.name.localeCompare(b.name));
+function dropStudent(socket,reason) {
+  const entry=students.get(socket.id); if(!entry)return;
+  students.delete(socket.id); socket.leave(room(entry.code));
+  const s=sessions.get(entry.code); if(!s)return;
+  const p=s.roster.get(entry.key); if(p && p.socketId===socket.id){p.connected=false;p.socketId=null;}
+  s.answers.delete(socket.id);
+  if(reason) socket.emit('room:left',reason);
+  broadcast(s);
 }
-
-function getPublicQuestion() {
-  if (currentQuestion < 0 || currentQuestion >= questions.length) return null;
-  const q = questions[currentQuestion];
-  return { text: q.text, choices: q.choices, timeLimit: q.timeLimit };
-}
-
-function getTimeLeftSeconds() {
-  if (!quizStarted || currentQuestion < 0 || !questionStartedAt) return 0;
-  const q = questions[currentQuestion];
-  const elapsed = (Date.now() - questionStartedAt) / 1000;
-  return Math.max(0, Math.ceil(q.timeLimit - elapsed));
-}
-
-function broadcast() {
-  io.emit('update', {
-    players: getLeaderboard(),
-    question: getPublicQuestion(),
-    quizStarted,
-    currentQuestion,
-    totalQuestions: questions.length,
-    revealAnswer,
-    correctAnswer: revealAnswer && currentQuestion >= 0 ? questions[currentQuestion].correct : null,
-    timeLeft: getTimeLeftSeconds()
+io.on('connection',socket=>{
+  socket.on('teacher:claim',passkey=>{
+    if(typeof passkey!=='string'||passkey!==TEACHER_PASSKEY){socket.emit('teacher:denied','Invalid teacher passkey.');return;}
+    if(teachers.has(socket.id)){socket.emit('teacher:granted',{code:teachers.get(socket.id)});return;}
+    const code=makeCode();const s={code,teacherId:socket.id,questions:seedQuestions.map(q=>({...q,choices:[...q.choices]})),roster:new Map(),answers:new Map(),questionIndex:-1,started:false,revealed:false,round:0,questionStart:0,timer:null};
+    sessions.set(code,s);teachers.set(socket.id,code);socket.join(room(code));socket.emit('teacher:granted',{code});broadcast(s);
   });
-}
-
-function resetQuestionState() {
-  answered = {};
-  questionStartedAt = Date.now();
-  revealAnswer = false;
-}
-
-function startQuestion(index) {
-  if (index < 0 || index >= questions.length) return;
-  currentQuestion = index;
-  quizStarted = true;
-  resetQuestionState();
-  broadcast();
-
-  setTimeout(() => {
-    if (quizStarted && currentQuestion === index && !revealAnswer) {
-      revealAnswer = true;
-      broadcast();
-    }
-  }, questions[index].timeLimit * 1000);
-}
-
-function calculateSpeedScore(answerTimeMs, timeLimitSeconds) {
-  const maxPoints = 100;
-  const minPoints = 20;
-  const timeLimitMs = timeLimitSeconds * 1000;
-  const safeAnswerTime = Math.max(0, Math.min(answerTimeMs, timeLimitMs));
-  const speedRatio = 1 - (safeAnswerTime / timeLimitMs);
-  return Math.round(minPoints + (speedRatio * (maxPoints - minPoints)));
-}
-
-io.on('connection', (socket) => {
-  socket.on('teacher:claim', (passkey) => {
-    if (String(passkey || '').trim() !== TEACHER_PASSKEY) {
-      socket.emit('teacher:denied', 'Wrong teacher passkey.');
-      return;
-    }
-    teacherSocketId = socket.id;
-    socket.emit('teacher:granted');
+  socket.on('join',data=>{
+    if(teachers.has(socket.id))return socket.emit('error-message','Teacher devices cannot join as students.');
+    const code=String(data?.code||'').trim().toUpperCase();const name=String(data?.name||'').trim().slice(0,40);
+    const s=sessions.get(code);
+    if(!s)return socket.emit('error-message','Invalid or expired room code.');
+    if(!name)return socket.emit('error-message','Enter your name.');
+    if(s.started)return socket.emit('error-message','This quiz has already started. Ask your teacher to reset the session.');
+    const key=name.toLocaleLowerCase();const existing=s.roster.get(key);
+    if(existing?.connected)return socket.emit('error-message','That name is already connected.');
+    if(students.has(socket.id))dropStudent(socket);
+    const p=existing||{name,score:0,connected:false,socketId:null};p.name=name;p.connected=true;p.socketId=socket.id;s.roster.set(key,p);
+    students.set(socket.id,{code,key});socket.join(room(code));socket.emit('joined',{name,code});broadcast(s);
   });
-
-  socket.on('teacher:load-questions', (newQuestions) => {
-    if (socket.id !== teacherSocketId) return;
-    if (Array.isArray(newQuestions) && newQuestions.length > 0) {
-      questions = newQuestions; 
-      currentQuestion = -1;
-      quizStarted = false;
-      answered = {};
-      questionStartedAt = null;
-      revealAnswer = false;
-      Object.keys(players).forEach(id => players[id].score = 0);
-      
-      io.emit('new-question');
-      broadcast();
-      socket.emit('teacher:questions-loaded');
-    }
+  socket.on('teacher:load-questions',list=>{const s=requireTeacher(socket);if(!s)return;const valid=validateQuestions(list);if(!valid)return socket.emit('error-message','Invalid questions JSON (1–200 questions; 2–8 choices; 5–300 seconds).');s.questions=valid;reset(s);socket.emit('teacher:questions-loaded');});
+  function reset(s){if(s.timer)clearTimeout(s.timer);s.started=false;s.revealed=false;s.questionIndex=-1;s.round++;s.answers.clear();s.questionStart=0;for(const p of s.roster.values())p.score=0;broadcast(s);}
+  socket.on('teacher:reset',()=>{const s=requireTeacher(socket);if(s)reset(s);});
+  socket.on('teacher:start',()=>{const s=requireTeacher(socket);if(s&&!s.started)startQuestion(s,0);});
+  socket.on('teacher:next',()=>{const s=requireTeacher(socket);if(!s||!s.started)return;if(s.questionIndex+1>=s.questions.length){s.revealed=true;if(s.timer)clearTimeout(s.timer);broadcast(s);generatePdf(socket,s);return;}startQuestion(s,s.questionIndex+1);});
+  socket.on('teacher:reveal',()=>{const s=requireTeacher(socket);if(s&&s.started){s.revealed=true;if(s.timer)clearTimeout(s.timer);broadcast(s);}});
+  socket.on('teacher:save',()=>{const s=requireTeacher(socket);if(s)generatePdf(socket,s);});
+  socket.on('answer',raw=>{
+    const entry=students.get(socket.id);if(!entry)return;const s=sessions.get(entry.code);if(!s||!s.started||s.revealed||s.answers.has(socket.id)||timeLeft(s)<=0)return;
+    const p=s.roster.get(entry.key);if(!p||!p.connected||p.socketId!==socket.id)return;
+    const q=s.questions[s.questionIndex],index=Number(raw);if(!Number.isInteger(index)||index<0||index>=q.choices.length)return;
+    const correct=index===q.correct;const elapsed=Math.max(0,Date.now()-s.questionStart);
+    const points=correct?Math.round(50+50*(1-Math.min(elapsed,q.timeLimit*1000)/(q.timeLimit*1000))):0;
+    if(correct)p.score+=points;s.answers.set(socket.id,{index,correct,points});socket.emit('answer:receipt',{round:s.round,points,correct});broadcast(s);
   });
-
-  socket.on('teacher:save', () => {
-    if (socket.id !== teacherSocketId) return;
-    saveResultsToPDF(socket); 
-  });
-
-  socket.on('join', name => {
-    const cleanName = String(name || '').trim().slice(0, 20);
-    if (!cleanName) {
-      socket.emit('error-message', 'Invalid name.');
-      return;
-    }
-    
-    // Restore score if they refreshed, or start at 0
-    if (persistentScores[cleanName] === undefined) {
-      persistentScores[cleanName] = 0;
-    }
-    
-    players[socket.id] = { name: cleanName, score: persistentScores[cleanName] };
-    socket.emit('joined', { name: cleanName });
-    broadcast();
-  });
-
-  socket.on('teacher:start', () => {
-    if (socket.id !== teacherSocketId) return;
-    startQuestion(0);
-    io.emit('new-question');
-  });
-
-  socket.on('teacher:next', () => {
-    if (socket.id !== teacherSocketId) return;
-    if (currentQuestion + 1 >= questions.length) {
-      revealAnswer = true;
-      broadcast();
-      saveResultsToPDF(socket);
-      return;
-    }
-    startQuestion(currentQuestion + 1);
-    io.emit('new-question');
-  });
-
-  socket.on('teacher:reveal', () => {
-    if (socket.id !== teacherSocketId) return;
-    revealAnswer = true;
-    broadcast();
-  });
-
-  socket.on('teacher:reset', () => {
-    if (socket.id !== teacherSocketId) return;
-    currentQuestion = -1;
-    quizStarted = false;
-    answered = {};
-    questionStartedAt = null;
-    revealAnswer = false;
-    Object.keys(players).forEach(id => players[id].score = 0);
-    persistentScores = {};
-    io.emit('new-question');
-    broadcast();
-  });
-
-  socket.on('answer', index => {
-    if (!quizStarted || currentQuestion < 0 || revealAnswer) return;
-    if (!players[socket.id]) return;
-    if (answered[socket.id]) return;
-
-    const q = questions[currentQuestion];
-    const answerTimeMs = Date.now() - questionStartedAt;
-    const isCorrect = Number(index) === q.correct;
-
-    answered[socket.id] = { index: Number(index), isCorrect, answerTimeMs };
-
-    if (isCorrect) {
-      const points = calculateSpeedScore(answerTimeMs, q.timeLimit);
-      players[socket.id].score += points;
-      // Add this line below to permanently back up the new score
-      persistentScores[players[socket.id].name] = players[socket.id].score; 
-    }
-
-    broadcast();
-  });
-
-  socket.on('disconnect', () => {
-    delete players[socket.id];
-    delete answered[socket.id];
-    if (teacherSocketId === socket.id) teacherSocketId = null;
-    broadcast();
+  socket.on('disconnect',()=>{
+    dropStudent(socket);
+    const code=teachers.get(socket.id);if(code){teachers.delete(socket.id);const s=sessions.get(code);if(s){if(s.timer)clearTimeout(s.timer);sessions.delete(code);for(const p of s.roster.values())if(p.socketId){const peer=io.sockets.sockets.get(p.socketId);if(peer){students.delete(p.socketId);peer.leave(room(code));peer.emit('room:left','The teacher has left; this room is closed.');}}}}
   });
 });
-
-server.listen(PORT, '0.0.0.0', () => {
-  console.log(`Server running at http://0.0.0.0:${PORT}`);
-});
+server.listen(PORT,'0.0.0.0',()=>console.log(`Quiz App running on port ${PORT}`));
